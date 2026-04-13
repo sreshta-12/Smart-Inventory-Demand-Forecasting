@@ -5,7 +5,7 @@ services:
     env: python
     rootDir: Smart-Inventory-Demand-Forecasting
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app.app:server"
+    startCommand: "gunicorn app.app:app.server"
     plan: free
 
   # The FastAPI Backend
