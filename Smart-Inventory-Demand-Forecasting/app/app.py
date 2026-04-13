@@ -920,5 +920,8 @@ def on_product_view(product_value, data):
     return (kpi, fig_sales, fig_inv, fig_perf, fig_next7, tbl, cal_div)
 
 
+# Expose the Flask server for gunicorn
+server = app.server
+
 if __name__ == '__main__':
     app.run(debug=True)
