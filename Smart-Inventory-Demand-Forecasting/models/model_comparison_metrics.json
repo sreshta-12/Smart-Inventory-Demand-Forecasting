@@ -1,0 +1,44 @@
+{
+  "models": {
+    "Linear Regression": {
+      "r2": 0.9860963325309983,
+      "rmse": 5.5266495675163245,
+      "mae": 4.438355798909444
+    },
+    "Random Forest": {
+      "r2": 0.9872181679680494,
+      "rmse": 5.298998477355291,
+      "mae": 4.225921917808219
+    }
+  },
+  "best_model": "Random Forest",
+  "best_metrics": {
+    "r2": 0.9872181679680494,
+    "rmse": 5.298998477355291,
+    "mae": 4.225921917808219
+  },
+  "ranking": [
+    "Random Forest",
+    "Linear Regression"
+  ],
+  "deployed_model": "Random Forest",
+  "forecast_system": {
+    "training_target": "next_day_units_sold",
+    "label_definition": "groupby(store,product)[units_sold].shift(-1) \u2014 exactly 1 day ahead",
+    "not_used": [
+      "shift(-7)",
+      "direct_multi_day_target",
+      "7_day_y_for_training"
+    ],
+    "horizon_days_recursive": 7,
+    "inference": "same model applied recursively for 7-day chart; test metrics are 1-step only"
+  },
+  "validation": {
+    "method": "time_series_holdout",
+    "split_rule": "train: date < 2023-01-01; test: date >= 2023-01-01",
+    "cutoff_date": "2023-01-01",
+    "metrics_scope": "one_step_ahead_only_r2_rmse_mae",
+    "metrics_not": "recursive_7_day_path"
+  },
+  "model_choice_rationale": "Target is next calendar day units_sold per store\u2013product (one-step-ahead). Features use lagged units_sold and 7-day mean/std using only history through day T (shifted rolls, no same-day leakage). Longer horizons use the same model recursively (7 days in the app). Trees often help on count data; linear models are a strong baseline with clear lag structure."
+}
