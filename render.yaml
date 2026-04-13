@@ -1,0 +1,18 @@
+services:
+  # The Dash Web Dashboard
+  - type: web
+    name: inventory-dashboard
+    env: python
+    rootDir: Smart-Inventory-Demand-Forecasting
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app.app:app.server"
+    plan: free
+
+  # The FastAPI Backend
+  - type: web
+    name: inventory-api
+    env: python
+    rootDir: Smart-Inventory-Demand-Forecasting
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+    plan: free
