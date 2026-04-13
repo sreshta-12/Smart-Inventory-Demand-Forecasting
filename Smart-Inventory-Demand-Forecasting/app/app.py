@@ -44,6 +44,7 @@ RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PR
 
 app = dash.Dash(__name__)
 app.title = 'Inventory Demand Forecasting'
+server = app.server
 
 CARD_STYLE = {
     'flex': '1',
