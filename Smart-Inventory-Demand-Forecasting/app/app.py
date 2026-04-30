@@ -36,10 +36,10 @@ from src.reorder import DEFAULT_LEAD_TIME_DAYS
 
 model, scaler, feature_cols, scaled_columns = load_artifacts()
 
-FORECAST_TAIL_PER_SERIES = 200
-FORECAST_MAX_GROUPS = 100
-HISTORY_DAYS_ON_FORECAST_CHART = 120
-DASHBOARD_RECORDS_HISTORY_DAYS = 200
+FORECAST_TAIL_PER_SERIES = 90
+FORECAST_MAX_GROUPS = 20
+HISTORY_DAYS_ON_FORECAST_CHART = 90
+DASHBOARD_RECORDS_HISTORY_DAYS = 120
 RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PRODUCT_NAME, PRICE, SEASONALITY]
 
 app = dash.Dash(__name__)
@@ -82,21 +82,12 @@ def json_for_json_store(val):
 
 def dates_as_strings(series):
     t = pd.to_datetime(series, errors='coerce')
-    out = []
-    for x in t:
-        out.append(x.strftime('%Y-%m-%d') if pd.notna(x) else '')
-    return out
+    return [x.strftime('%Y-%m-%d') if pd.notna(x) else '' for x in t]
 
 
 def nums_as_plain_list(series):
-    arr = np.asarray(pd.to_numeric(series, errors='coerce'), dtype=float)
-    plain = []
-    for v in arr.flat:
-        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-            plain.append(None)
-        else:
-            plain.append(float(v))
-    return plain
+    arr = pd.to_numeric(series, errors='coerce').values.astype(float)
+    return [None if (v != v or not np.isfinite(v)) else float(v) for v in arr]
 
 
 def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
@@ -363,13 +354,16 @@ def chart_next_week(raw_records: list | None, product_value: str, precomputed_ca
     leg = layout_with_legend_at_bottom()
     pv = product_value or 'ALL'
     cal = None
-    if pv == 'ALL' and precomputed_cal_records:
+    # Always try precomputed first; only fall back to live inference for single products
+    if precomputed_cal_records:
         cal = pd.DataFrame(precomputed_cal_records)
         if not cal.empty and 'forecast_date' in cal.columns:
             cal = cal.copy()
             cal['forecast_date'] = pd.to_datetime(cal['forecast_date'], errors='coerce')
             cal = cal.dropna(subset=['forecast_date'])
-    if cal is None or cal.empty:
+        else:
+            cal = None
+    if (cal is None or cal.empty) and pv != 'ALL':
         raw_df = raw_slice_to_df(raw_records, pv)
         cal = seven_day_forecast_table(raw_df)
     if cal is None or cal.empty:
@@ -588,8 +582,8 @@ def make_layout():
         style={'padding': '8px 16px', 'borderRadius': '6px', 'border': '1px solid #ccc', 'cursor': 'pointer'},
     )
     btn_row = html.Div([load_btn, reload_btn], style={'textAlign': 'center', 'marginBottom': '12px'})
-    startup_timer = dcc.Interval(id='startup-load', interval=1, n_intervals=0, max_intervals=1)
-    poll_timer = dcc.Interval(id='live-poll', interval=20000, n_intervals=0)
+    startup_timer = dcc.Interval(id='startup-load', interval=500, n_intervals=0, max_intervals=1)
+    poll_timer = dcc.Interval(id='live-poll', interval=120000, n_intervals=0)
     product_dd = dcc.Dropdown(
         id='product-filter',
         options=[{'label': 'All Products', 'value': 'ALL'}],
@@ -632,15 +626,15 @@ def make_layout():
             'margin': '16px auto',
         },
     )
-    g1 = dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
-    g2 = dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
+    g1 = dcc.Loading(dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}), type='circle')
+    g2 = dcc.Loading(dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}), type='circle')
     perf_block = html.Div([
         html.H3('Model Performance (Actual vs Predicted)', style=GRAPH_SECTION_TITLE),
-        dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
+        dcc.Loading(dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}), type='circle'),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     week_block = html.Div([
         html.H3('Next 7-Day Demand Forecast', style=GRAPH_SECTION_TITLE),
-        dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
+        dcc.Loading(dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}), type='circle'),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     cal_wrap = html.Div([
         html.H3('Next 7-day forecast — exact values (table)', style=GRAPH_SECTION_TITLE),
@@ -719,13 +713,13 @@ def on_data_in(contents, n_def, n_rel, _n_startup, n_live, filename, last_count)
         if not CSV_SIMPLE.exists():
             raise PreventUpdate
         try:
-            cur = len(pd.read_csv(CSV_SIMPLE))
+            cur = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0])
         except Exception:
             raise PreventUpdate
         if last_count is not None and cur == last_count:
             raise PreventUpdate
         df = load_data()
-        payload, err = build_payload_from_df(df, persist_forecasts=True)
+        payload, err = build_payload_from_df(df, persist_forecasts=False)
         if err:
             raise PreventUpdate
         opts = product_dropdown_options(payload)
@@ -759,17 +753,22 @@ def on_data_in(contents, n_def, n_rel, _n_startup, n_live, filename, last_count)
         _, b64 = contents.split(',')
         raw = base64.b64decode(b64)
         try:
-            df = pd.read_csv(io.StringIO(raw.decode('utf-8')))
-        except Exception:
-            return ('Error reading file.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+            df = pd.read_csv(io.StringIO(raw.decode('utf-8', errors='replace')))
+        except Exception as e:
+            return (f'Error reading file: {e}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
         df = ensure_training_columns(df)
+        # Auto-inject missing columns so any retail CSV can be loaded
         if STORE_ID not in df.columns:
-            return ('CSV must include store_id.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+            df[STORE_ID] = 'store_1'
+        if PRODUCT_ID not in df.columns and 'product' in df.columns:
+            df = df.rename(columns={'product': PRODUCT_ID})
+        if PRODUCT_ID not in df.columns:
+            df[PRODUCT_ID] = df.index.astype(str)
         payload, err = build_payload_from_df(df, persist_forecasts=False)
         if err:
             return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
         opts = product_dropdown_options(payload)
-        return (f"File '{filename}' processed.", payload, opts, 'ALL', False, last_count)
+        return (f"File '{filename}' processed ({len(df):,} rows).", payload, opts, 'ALL', False, last_count)
 
     raise PreventUpdate
 
@@ -856,13 +855,18 @@ def on_product_view(product_value, data):
     snap = df[df[DATE] == dmax]
     reorder_needed_units = reorder_gap_units(snap)
     pv = product_value or 'ALL'
-    raw_for_kpi = raw_slice_to_df(data.get('raw_slice'), pv)
 
+    # Use precomputed calendar — avoid expensive re-inference on every product switch
     cal_tbl = None
-    if pv == 'ALL' and data.get('calendar_forecast_agg'):
+    if data.get('calendar_forecast_agg'):
         cal_tbl = pd.DataFrame(data['calendar_forecast_agg'])
-    if cal_tbl is None or cal_tbl.empty:
-        cal_tbl = seven_day_forecast_table(raw_for_kpi)
+    if cal_tbl is not None and not cal_tbl.empty and pv != 'ALL':
+        # Per-product view: try to recompute only for that series
+        raw_for_kpi = raw_slice_to_df(data.get('raw_slice'), pv)
+        if len(raw_for_kpi) >= 50:
+            single = seven_day_forecast_table(raw_for_kpi)
+            if single is not None and not single.empty:
+                cal_tbl = single
 
     pred_7d = 0
     try:
@@ -906,10 +910,9 @@ def on_product_view(product_value, data):
     fig_sales = chart_sales_trend(df)
     fig_inv = chart_inventory_bars(df)
     fig_perf = chart_actual_vs_pred(df)
-    if pv == 'ALL':
-        pre_cal = data.get('calendar_forecast_agg')
-    else:
-        pre_cal = None
+    # Pass precomputed data always; chart_next_week will use it for ALL and
+    # fall back to per-product raw_slice only when the precomputed list is absent.
+    pre_cal = data.get('calendar_forecast_agg')
     fig_next7 = chart_next_week(data.get('raw_slice'), pv, pre_cal)
     tbl = reorder_table_html(df)
     if cal_tbl is not None and not cal_tbl.empty:
