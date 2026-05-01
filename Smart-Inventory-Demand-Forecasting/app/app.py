@@ -120,12 +120,17 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
         raw_concat = show.iloc[:0]
 
     rs_cols = [c for c in RAW_SLICE_COLUMNS if c in raw_concat.columns]
-    raw_slim = raw_concat[rs_cols] if (rs_cols and UNITS_SOLD in rs_cols) else raw_concat
+    if rs_cols and UNITS_SOLD in rs_cols:
+        raw_slim = raw_concat[rs_cols]
+    else:
+        raw_slim = raw_concat
 
-    # Vectorised serialisation — avoid per-row Python loop
-    raw_slim = raw_slim.copy()
-    raw_slim[DATE] = pd.to_datetime(raw_slim[DATE], errors='coerce').dt.strftime('%Y-%m-%d')
-    raw_records = raw_slim.where(raw_slim.notna(), other=None).to_dict(orient='records')
+    raw_records = []
+    for rec in raw_slim.to_dict(orient='records'):
+        row = {k: json_for_json_store(v) for k, v in rec.items()}
+        if DATE in row and row[DATE] is not None:
+            row[DATE] = str(pd.to_datetime(row[DATE]).date())
+        raw_records.append(row)
 
     calendar_forecast_agg = None
     if len(raw_concat) >= 50:
@@ -147,7 +152,7 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
         STORE_ID: show[STORE_ID].astype(str),
         PRODUCT_ID: show[PRODUCT_ID].astype(str),
         PRODUCT_NAME: names,
-        DATE: show[DATE].dt.strftime('%Y-%m-%d'),
+        DATE: show[DATE].astype(str),
         INVENTORY_LEVEL: inv_vals,
         PREDICTED_DEMAND: show[PREDICTED_DEMAND],
         REORDER_POINT: pd.to_numeric(show[REORDER_POINT], errors='coerce'),
