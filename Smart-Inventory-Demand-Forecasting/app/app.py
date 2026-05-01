@@ -1,6 +1,7 @@
 import base64
 import io
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -38,10 +39,44 @@ from src.reorder import DEFAULT_LEAD_TIME_DAYS
 model, scaler, feature_cols, scaled_columns = load_artifacts()
 
 FORECAST_TAIL_PER_SERIES = 200     # rows per group shown in dashboard charts
-FORECAST_MAX_GROUPS = 15           # max groups to run 7-day forecast on (speed)
+FORECAST_MAX_GROUPS = 3            # max groups for 7-day forecast (speed: 3×7=21 model calls)
 HISTORY_DAYS_ON_FORECAST_CHART = 120
 DASHBOARD_RECORDS_HISTORY_DAYS = 200
+_ML_ROWS_PER_GROUP = 180           # rows per group fed to ML (keeps stats stable)
 RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PRODUCT_NAME, PRICE, SEASONALITY]
+
+# ── Background computation cache ──────────────────────────────────────────
+# Runs the heavy ML pipeline in a background daemon thread so the
+# Gunicorn worker timeout (30 s) is never hit by a Dash callback.
+_payload_cache: dict = {'status': 'idle', 'payload': None, 'msg': '', 't_start': 0.0}
+_cache_lock = threading.Lock()
+
+
+def _compute_and_cache(df_override=None, label='default dataset'):
+    """Run load_data + build_payload in background; store result in _payload_cache."""
+    t0 = time.time()
+    with _cache_lock:
+        _payload_cache.update({'status': 'running', 'payload': None,
+                               'msg': f'⏳ Processing {label}…', 't_start': t0})
+    try:
+        df = df_override if df_override is not None else load_data()
+        payload, err = build_payload_from_df(df, persist_forecasts=False)
+        elapsed = time.time() - t0
+        with _cache_lock:
+            if err:
+                _payload_cache.update({'status': 'error', 'msg': f'❌ {err}'})
+            else:
+                _payload_cache.update({
+                    'status': 'done', 'payload': payload,
+                    'msg': f'✅ Loaded {label} in {elapsed:.1f}s',
+                })
+    except Exception as exc:
+        with _cache_lock:
+            _payload_cache.update({'status': 'error', 'msg': f'❌ Error: {exc}'})
+
+
+# Kick off background load the moment the module is imported
+threading.Thread(target=_compute_and_cache, daemon=True).start()
 
 app = dash.Dash(__name__)
 app.title = 'Inventory Demand Forecasting'
@@ -93,6 +128,15 @@ def nums_as_plain_list(series):
 
 def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
     df = ensure_training_columns(df.copy())
+    # Cap rows per group BEFORE ML to control runtime while keeping stats stable.
+    # _ML_ROWS_PER_GROUP rows gives enough history for lag features + reorder stats.
+    df[DATE] = pd.to_datetime(df[DATE], errors='coerce')
+    df = (
+        df.sort_values(DATE)
+          .groupby([STORE_ID, PRODUCT_ID], group_keys=False)
+          .tail(_ML_ROWS_PER_GROUP)
+          .reset_index(drop=True)
+    )
     slice_scored, _df_out = run_batch_predict(
         df, model, scaler, feature_cols, scaled_columns,
         lead_time_days=DEFAULT_LEAD_TIME_DAYS,
@@ -581,8 +625,10 @@ def make_layout():
         style={'padding': '8px 16px', 'borderRadius': '6px', 'border': '1px solid #ccc', 'cursor': 'pointer'},
     )
     btn_row = html.Div([load_btn, reload_btn], style={'textAlign': 'center', 'marginBottom': '12px'})
+    # startup-load fires once after 1 s to check if background compute is done
     startup_timer = dcc.Interval(id='startup-load', interval=1000, n_intervals=0, max_intervals=1)
-    poll_timer = dcc.Interval(id='live-poll', interval=120000, n_intervals=0)
+    # cache-poll fires every 2 s while background thread is running
+    cache_poll = dcc.Interval(id='cache-poll', interval=2000, n_intervals=0, disabled=False)
     product_dd = dcc.Dropdown(
         id='product-filter',
         options=[{'label': 'All Products', 'value': 'ALL'}],
@@ -615,27 +661,6 @@ def make_layout():
     status = html.Div(id='upload-status', style={'textAlign': 'center', 'margin': '8px', 'color': 'green'})
     store = dcc.Store(id='results-store')
     last_ct = dcc.Store(id='last-row-count', data=None)
-
-    # ⏳ Processing animation — shown while results-store is being populated
-    processing_banner = html.Div(
-        id='processing-banner',
-        children='⏳ Processing data, please wait...',
-        style={
-            'display': 'none',
-            'textAlign': 'center',
-            'padding': '12px',
-            'margin': '8px auto',
-            'maxWidth': '500px',
-            'backgroundColor': '#fff8e1',
-            'border': '1px solid #f9a825',
-            'borderRadius': '8px',
-            'color': '#e65100',
-            'fontWeight': 'bold',
-            'fontSize': '15px',
-            'animation': 'pulse 1.2s infinite',
-        },
-    )
-    # CSS animation is in app/assets/animations.css (loaded automatically by Dash)
 
     kpis = dcc.Loading(
         html.Div(
@@ -685,11 +710,10 @@ def make_layout():
         hdr,
         btn_row,
         startup_timer,
-        poll_timer,
+        cache_poll,
         product_block,
         upload_box,
         status,
-        processing_banner,
         store,
         last_ct,
         kpis,
@@ -710,141 +734,77 @@ def empty_after_failed_load(last_count):
 
 
 @app.callback(
-    Output('processing-banner', 'style'),
-    Input('btn-load-default', 'n_clicks'),
-    Input('btn-reload-db', 'n_clicks'),
-    Input('startup-load', 'n_intervals'),
-    Input('upload-data', 'contents'),
-    Input('results-store', 'data'),
-    prevent_initial_call=True,
-)
-def toggle_processing_banner(n_def, n_rel, _n_start, _upload, _data):
-    ctx = dash.callback_context
-    if not ctx.triggered:
-        raise PreventUpdate
-    who = ctx.triggered[0]['prop_id'].split('.')[0]
-    _SHOW = {
-        'display': 'block',
-        'textAlign': 'center',
-        'padding': '12px',
-        'margin': '8px auto',
-        'maxWidth': '500px',
-        'backgroundColor': '#fff8e1',
-        'border': '1px solid #f9a825',
-        'borderRadius': '8px',
-        'color': '#e65100',
-        'fontWeight': 'bold',
-        'fontSize': '15px',
-        'animation': 'pulse 1.2s infinite',
-    }
-    _HIDE = {'display': 'none'}
-    # Show when a load action is triggered, hide when results-store is updated
-    if who == 'results-store':
-        return _HIDE
-    return _SHOW
-
-
-
-@app.callback(
     Output('upload-status', 'children'),
     Output('results-store', 'data'),
     Output('product-filter', 'options'),
     Output('product-filter', 'value'),
     Output('product-filter', 'disabled'),
     Output('last-row-count', 'data'),
-    Input('upload-data', 'contents'),
+    Output('cache-poll', 'disabled'),
+    Input('cache-poll', 'n_intervals'),
+    Input('startup-load', 'n_intervals'),
     Input('btn-load-default', 'n_clicks'),
     Input('btn-reload-db', 'n_clicks'),
-    Input('startup-load', 'n_intervals'),
-    Input('live-poll', 'n_intervals'),
+    Input('upload-data', 'contents'),
     State('upload-data', 'filename'),
     State('last-row-count', 'data'),
     prevent_initial_call=True,
 )
-def on_data_in(contents, n_def, n_rel, _n_startup, n_live, filename, last_count):
+def on_data_in(n_poll, _n_start, n_def, n_rel, contents, filename, last_count):
     ctx = dash.callback_context
     who = ctx.triggered[0]['prop_id'].split('.')[0]
+    _NO = dash.no_update  # partial-update sentinel
 
-    if who == 'startup-load':
-        t0 = time.time()
-        try:
-            df = load_data()
-        except Exception as e:
-            return (f'Startup load error: {e}', *empty_after_failed_load(None)[1:])
-        t1 = time.time()
-        payload, err = build_payload_from_df(df, persist_forecasts=False)
-        t2 = time.time()
-        if err:
-            return (err, None, *empty_after_failed_load(None)[2:])
-        opts = product_dropdown_options(payload)
-        try:
-            cnt = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0]) if CSV_SIMPLE.exists() else None
-        except Exception:
-            cnt = None
-        msg = (f'Loaded default dataset — '
-               f'Data read: {t1-t0:.1f}s | '
-               f'ML + forecast: {t2-t1:.1f}s | '
-               f'Total: {t2-t0:.1f}s')
-        return (msg, payload, opts, 'ALL', False, cnt)
+    # ── Polling: check background cache ──────────────────────────────────
+    if who in ('cache-poll', 'startup-load'):
+        with _cache_lock:
+            status = _payload_cache['status']
+            msg    = _payload_cache['msg']
+            payload = _payload_cache.get('payload')
+            t0      = _payload_cache.get('t_start', time.time())
 
-    if who == 'live-poll':
-        if not CSV_SIMPLE.exists():
-            raise PreventUpdate
-        try:
-            cur = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0])
-        except Exception:
-            raise PreventUpdate
-        if last_count is not None and cur == last_count:
-            raise PreventUpdate
-        df = load_data()
-        payload, err = build_payload_from_df(df, persist_forecasts=False)
-        if err:
-            raise PreventUpdate
-        opts = product_dropdown_options(payload)
-        return (f'Auto-refreshed ({cur} rows in CSV).', payload, opts, 'ALL', False, cur)
+        elapsed = time.time() - t0
 
+        if status == 'done' and payload is not None:
+            opts = product_dropdown_options(payload)
+            try:
+                cnt = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0]) if CSV_SIMPLE.exists() else None
+            except Exception:
+                cnt = None
+            return (msg, payload, opts, 'ALL', False, cnt, True)  # True = stop polling
+
+        if status == 'error':
+            return (msg, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, None, True)
+
+        # Still running — update status text only, keep everything else unchanged
+        live_msg = f'⏳ Processing… {elapsed:.0f}s elapsed (model running in background)'
+        return (live_msg, _NO, _NO, _NO, _NO, _NO, False)  # keep polling
+
+    # ── Button: kick off a new background computation ──────────────────
     if who in ('btn-load-default', 'btn-reload-db'):
-        t0 = time.time()
-        try:
-            df = load_data()
-        except Exception as e:
-            return (f'Load error: {e}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        t1 = time.time()
-        save_db = who == 'btn-load-default'
-        payload, err = build_payload_from_df(df, persist_forecasts=save_db)
-        t2 = time.time()
-        if err:
-            return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        opts = product_dropdown_options(payload)
-        try:
-            cnt = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0]) if CSV_SIMPLE.exists() else last_count
-        except Exception:
-            cnt = last_count
-        msg = (f'Loaded data — '
-               f'Read: {t1-t0:.1f}s | '
-               f'ML + forecast: {t2-t1:.1f}s | '
-               f'Total: {t2-t0:.1f}s')
-        if save_db:
-            msg += ' (saved to DB)'
-        return (msg, payload, opts, 'ALL', False, cnt)
+        with _cache_lock:
+            if _payload_cache['status'] == 'running':
+                return ('⏳ Already processing, please wait…', _NO, _NO, _NO, _NO, _NO, False)
+        # Start fresh background computation
+        threading.Thread(target=_compute_and_cache, daemon=True).start()
+        return ('⏳ Processing started… dashboard will update automatically.', _NO, _NO, _NO, _NO, _NO, False)
 
+    # ── Upload: parse CSV then run in background ─────────────────────
     if who == 'upload-data':
         if contents is None:
             raise PreventUpdate
         _, b64 = contents.split(',')
-        raw = base64.b64decode(b64)
         try:
-            df = pd.read_csv(io.StringIO(raw.decode('utf-8')))
-        except Exception:
-            return ('Error reading file.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        df = ensure_training_columns(df)
-        if STORE_ID not in df.columns:
-            return ('CSV must include store_id.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        payload, err = build_payload_from_df(df, persist_forecasts=False)
-        if err:
-            return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        opts = product_dropdown_options(payload)
-        return (f"File '{filename}' processed.", payload, opts, 'ALL', False, last_count)
+            df_up = pd.read_csv(io.StringIO(base64.b64decode(b64).decode('utf-8', errors='replace')))
+        except Exception as exc:
+            return (f'❌ Cannot read file: {exc}', _NO, _NO, _NO, _NO, _NO, _NO)
+        df_up = ensure_training_columns(df_up)
+        if STORE_ID not in df_up.columns:
+            df_up[STORE_ID] = 'store_1'
+        lbl = f"file '{filename}'"
+        threading.Thread(target=_compute_and_cache, args=(df_up, lbl), daemon=True).start()
+        return (f"⏳ Processing '{filename}'… dashboard will update automatically.",
+                _NO, _NO, _NO, _NO, _NO, False)
 
     raise PreventUpdate
 
@@ -936,13 +896,8 @@ def on_product_view(product_value, data):
     cal_tbl = None
     if data.get('calendar_forecast_agg'):
         cal_tbl = pd.DataFrame(data['calendar_forecast_agg'])
-    if cal_tbl is not None and not cal_tbl.empty and pv != 'ALL':
-        # Per-product view: try to recompute only for that series
-        raw_for_kpi = raw_slice_to_df(data.get('raw_slice'), pv)
-        if len(raw_for_kpi) >= 50:
-            single = seven_day_forecast_table(raw_for_kpi)
-            if single is not None and not single.empty:
-                cal_tbl = single
+    # Never re-run ML per product — use precomputed forecast for all views
+
 
     pred_7d = 0
     try:
