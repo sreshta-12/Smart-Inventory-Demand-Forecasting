@@ -635,14 +635,7 @@ def make_layout():
             'animation': 'pulse 1.2s infinite',
         },
     )
-    # Inject CSS keyframe animation via a style tag
-    anim_style = html.Style("""
-        @keyframes pulse {
-            0%   { opacity: 1; }
-            50%  { opacity: 0.4; }
-            100% { opacity: 1; }
-        }
-    """)
+    # CSS animation is in app/assets/animations.css (loaded automatically by Dash)
 
     kpis = dcc.Loading(
         html.Div(
@@ -689,7 +682,6 @@ def make_layout():
         dcc.Loading(html.Div(id='reorder-table'), type='dot'),
     ], style={'maxWidth': '720px', 'margin': '0 auto 32px'})
     return html.Div([
-        anim_style,
         hdr,
         btn_row,
         startup_timer,
