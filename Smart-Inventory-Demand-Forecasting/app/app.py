@@ -131,7 +131,10 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
     if len(raw_concat) >= 50:
         cal_tbl = seven_day_forecast_table(raw_concat)
         if cal_tbl is not None and not cal_tbl.empty:
-            calendar_forecast_agg = cal_tbl.where(cal_tbl.notna(), other=None).to_dict(orient='records')
+            calendar_forecast_agg = []
+            for r in cal_tbl.to_dict(orient='records'):
+                rr = {k: json_for_json_store(v) for k, v in r.items()}
+                calendar_forecast_agg.append(rr)
 
     if INVENTORY_LEVEL in show.columns:
         inv_vals = show[INVENTORY_LEVEL]
@@ -156,8 +159,14 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
     dmin = pd.to_datetime(out_df[DATE], errors='coerce').min()
     dmax = pd.to_datetime(out_df[DATE], errors='coerce').max()
 
-    # Vectorised serialisation — avoid per-row Python loop
-    table_records = out_df.where(out_df.notna(), other=None).to_dict(orient='records')
+    # Safe per-row serialisation — converts numpy types to plain Python
+    # (required for REORDER_POINT/INVENTORY_LEVEL to compute correctly later)
+    table_records = []
+    for r in out_df.to_dict('records'):
+        row = {k: json_for_json_store(v) for k, v in r.items()}
+        if DATE in row and row[DATE] is not None:
+            row[DATE] = str(row[DATE])
+        table_records.append(row)
 
     meta = {
         'n_products': n_products_full,
