@@ -36,11 +36,11 @@ from src.reorder import DEFAULT_LEAD_TIME_DAYS
 
 model, scaler, feature_cols, scaled_columns = load_artifacts()
 
-FORECAST_TAIL_PER_SERIES = 60      # rows per group sent to 7-day forecaster
-FORECAST_MAX_GROUPS = 15           # max store-product groups to forecast
-HISTORY_DAYS_ON_FORECAST_CHART = 90
-DASHBOARD_RECORDS_HISTORY_DAYS = 90
-_MAX_ROWS_TO_PROCESS = 5000        # cap rows from CSV/DB before heavy ML work
+FORECAST_TAIL_PER_SERIES = 200     # rows per group shown in dashboard charts
+FORECAST_MAX_GROUPS = 15           # max groups to run 7-day forecast on (speed)
+HISTORY_DAYS_ON_FORECAST_CHART = 120
+DASHBOARD_RECORDS_HISTORY_DAYS = 200
+_MAX_ROWS_TO_PROCESS = 5000        # cap rows fed into ML model (not display)
 RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PRODUCT_NAME, PRICE, SEASONALITY]
 
 app = dash.Dash(__name__)
