@@ -1,6 +1,7 @@
 import base64
 import io
 import sys
+import time
 from pathlib import Path
 
 import dash
@@ -690,22 +691,26 @@ def on_data_in(contents, n_def, n_rel, _n_startup, n_live, filename, last_count)
     who = ctx.triggered[0]['prop_id'].split('.')[0]
 
     if who == 'startup-load':
+        t0 = time.time()
         try:
             df = load_data()
         except Exception as e:
             return (f'Startup load error: {e}', *empty_after_failed_load(None)[1:])
+        t1 = time.time()
         payload, err = build_payload_from_df(df, persist_forecasts=False)
+        t2 = time.time()
         if err:
             return (err, None, *empty_after_failed_load(None)[2:])
         opts = product_dropdown_options(payload)
         try:
-            if CSV_SIMPLE.exists():
-                cnt = len(pd.read_csv(CSV_SIMPLE))
-            else:
-                cnt = None
+            cnt = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0]) if CSV_SIMPLE.exists() else None
         except Exception:
             cnt = None
-        return ('Loaded default dataset.', payload, opts, 'ALL', False, cnt)
+        msg = (f'Loaded default dataset — '
+               f'Data read: {t1-t0:.1f}s | '
+               f'ML + forecast: {t2-t1:.1f}s | '
+               f'Total: {t2-t0:.1f}s')
+        return (msg, payload, opts, 'ALL', False, cnt)
 
     if who == 'live-poll':
         if not CSV_SIMPLE.exists():
@@ -724,25 +729,28 @@ def on_data_in(contents, n_def, n_rel, _n_startup, n_live, filename, last_count)
         return (f'Auto-refreshed ({cur} rows in CSV).', payload, opts, 'ALL', False, cur)
 
     if who in ('btn-load-default', 'btn-reload-db'):
+        t0 = time.time()
         try:
             df = load_data()
         except Exception as e:
             return (f'Load error: {e}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        t1 = time.time()
         save_db = who == 'btn-load-default'
         payload, err = build_payload_from_df(df, persist_forecasts=save_db)
+        t2 = time.time()
         if err:
             return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
         opts = product_dropdown_options(payload)
-        msg = 'Loaded data.'
-        if save_db:
-            msg += ' Predictions saved to database.'
         try:
-            if CSV_SIMPLE.exists():
-                cnt = len(pd.read_csv(CSV_SIMPLE))
-            else:
-                cnt = last_count
+            cnt = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0]) if CSV_SIMPLE.exists() else last_count
         except Exception:
             cnt = last_count
+        msg = (f'Loaded data — '
+               f'Read: {t1-t0:.1f}s | '
+               f'ML + forecast: {t2-t1:.1f}s | '
+               f'Total: {t2-t0:.1f}s')
+        if save_db:
+            msg += ' (saved to DB)'
         return (msg, payload, opts, 'ALL', False, cnt)
 
     if who == 'upload-data':
