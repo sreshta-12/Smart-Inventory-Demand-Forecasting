@@ -40,7 +40,6 @@ FORECAST_TAIL_PER_SERIES = 200     # rows per group shown in dashboard charts
 FORECAST_MAX_GROUPS = 15           # max groups to run 7-day forecast on (speed)
 HISTORY_DAYS_ON_FORECAST_CHART = 120
 DASHBOARD_RECORDS_HISTORY_DAYS = 200
-_MAX_ROWS_TO_PROCESS = 5000        # cap rows fed into ML model (not display)
 RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PRODUCT_NAME, PRICE, SEASONALITY]
 
 app = dash.Dash(__name__)
@@ -93,13 +92,6 @@ def nums_as_plain_list(series):
 
 def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
     df = ensure_training_columns(df.copy())
-    # Cap rows before heavy ML — keep only the most recent rows per group
-    if len(df) > _MAX_ROWS_TO_PROCESS:
-        df[DATE] = pd.to_datetime(df[DATE], errors='coerce')
-        df = df.sort_values(DATE).groupby(
-            [STORE_ID, PRODUCT_ID], group_keys=False
-        ).tail(120).reset_index(drop=True)
-
     slice_scored, _df_out = run_batch_predict(
         df, model, scaler, feature_cols, scaled_columns,
         lead_time_days=DEFAULT_LEAD_TIME_DAYS,
