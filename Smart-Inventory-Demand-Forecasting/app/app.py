@@ -36,11 +36,11 @@ from src.reorder import DEFAULT_LEAD_TIME_DAYS
 
 model, scaler, feature_cols, scaled_columns = load_artifacts()
 
-FORECAST_TAIL_PER_SERIES = 60
-FORECAST_MAX_GROUPS = 10
-HISTORY_DAYS_ON_FORECAST_CHART = 60
+FORECAST_TAIL_PER_SERIES = 60      # rows per group sent to 7-day forecaster
+FORECAST_MAX_GROUPS = 15           # max store-product groups to forecast
+HISTORY_DAYS_ON_FORECAST_CHART = 90
 DASHBOARD_RECORDS_HISTORY_DAYS = 90
-DEFAULT_SAMPLE_ROWS = 3000   # cap default CSV to this many rows for speed
+_MAX_ROWS_TO_PROCESS = 5000        # cap rows from CSV/DB before heavy ML work
 RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PRODUCT_NAME, PRICE, SEASONALITY]
 
 app = dash.Dash(__name__)
@@ -93,6 +93,13 @@ def nums_as_plain_list(series):
 
 def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
     df = ensure_training_columns(df.copy())
+    # Cap rows before heavy ML — keep only the most recent rows per group
+    if len(df) > _MAX_ROWS_TO_PROCESS:
+        df[DATE] = pd.to_datetime(df[DATE], errors='coerce')
+        df = df.sort_values(DATE).groupby(
+            [STORE_ID, PRODUCT_ID], group_keys=False
+        ).tail(120).reset_index(drop=True)
+
     slice_scored, _df_out = run_batch_predict(
         df, model, scaler, feature_cols, scaled_columns,
         lead_time_days=DEFAULT_LEAD_TIME_DAYS,
@@ -121,43 +128,31 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
         raw_concat = show.iloc[:0]
 
     rs_cols = [c for c in RAW_SLICE_COLUMNS if c in raw_concat.columns]
-    if rs_cols and UNITS_SOLD in rs_cols:
-        raw_slim = raw_concat[rs_cols]
-    else:
-        raw_slim = raw_concat
+    raw_slim = raw_concat[rs_cols] if (rs_cols and UNITS_SOLD in rs_cols) else raw_concat
 
-    raw_records = []
-    for rec in raw_slim.to_dict(orient='records'):
-        row = {k: json_for_json_store(v) for k, v in rec.items()}
-        if DATE in row and row[DATE] is not None:
-            row[DATE] = str(pd.to_datetime(row[DATE]).date())
-        raw_records.append(row)
+    # Vectorised serialisation — avoid per-row Python loop
+    raw_slim = raw_slim.copy()
+    raw_slim[DATE] = pd.to_datetime(raw_slim[DATE], errors='coerce').dt.strftime('%Y-%m-%d')
+    raw_records = raw_slim.where(raw_slim.notna(), other=None).to_dict(orient='records')
 
     calendar_forecast_agg = None
     if len(raw_concat) >= 50:
         cal_tbl = seven_day_forecast_table(raw_concat)
         if cal_tbl is not None and not cal_tbl.empty:
-            calendar_forecast_agg = []
-            for r in cal_tbl.to_dict(orient='records'):
-                rr = {k: json_for_json_store(v) for k, v in r.items()}
-                calendar_forecast_agg.append(rr)
+            calendar_forecast_agg = cal_tbl.where(cal_tbl.notna(), other=None).to_dict(orient='records')
 
     if INVENTORY_LEVEL in show.columns:
-        inv_col = INVENTORY_LEVEL
-        inv_vals = show[inv_col]
+        inv_vals = show[INVENTORY_LEVEL]
     else:
         inv_vals = 0
 
-    if PRODUCT_NAME in show.columns:
-        names = show[PRODUCT_NAME].astype(str)
-    else:
-        names = show[PRODUCT_ID].astype(str)
+    names = show[PRODUCT_NAME].astype(str) if PRODUCT_NAME in show.columns else show[PRODUCT_ID].astype(str)
 
     out_df = pd.DataFrame({
         STORE_ID: show[STORE_ID].astype(str),
         PRODUCT_ID: show[PRODUCT_ID].astype(str),
         PRODUCT_NAME: names,
-        DATE: show[DATE].astype(str),
+        DATE: show[DATE].dt.strftime('%Y-%m-%d'),
         INVENTORY_LEVEL: inv_vals,
         PREDICTED_DEMAND: show[PREDICTED_DEMAND],
         REORDER_POINT: pd.to_numeric(show[REORDER_POINT], errors='coerce'),
@@ -169,12 +164,8 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
     dmin = pd.to_datetime(out_df[DATE], errors='coerce').min()
     dmax = pd.to_datetime(out_df[DATE], errors='coerce').max()
 
-    table_records = []
-    for r in out_df.to_dict('records'):
-        row = {k: json_for_json_store(v) for k, v in r.items()}
-        if DATE in row and row[DATE] is not None:
-            row[DATE] = str(row[DATE])
-        table_records.append(row)
+    # Vectorised serialisation — avoid per-row Python loop
+    table_records = out_df.where(out_df.notna(), other=None).to_dict(orient='records')
 
     meta = {
         'n_products': n_products_full,
@@ -561,98 +552,30 @@ def reorder_table_html(df: pd.DataFrame) -> html.Div:
 def make_layout():
     hdr = html.H1(
         'Smart Inventory Demand Forecasting',
-        style={'textAlign': 'center', 'marginBottom': '4px'},
+        style={'textAlign': 'center', 'marginBottom': '16px'},
     )
     load_btn = html.Button(
-        '📂 Load Default Dataset',
+        'Load from database / default CSV',
         id='btn-load-default',
         n_clicks=0,
         style={
-            'padding': '10px 20px',
+            'padding': '8px 16px',
             'borderRadius': '6px',
             'border': '1px solid #2e7d32',
             'backgroundColor': '#e8f5e9',
             'cursor': 'pointer',
             'marginRight': '8px',
-            'fontWeight': 'bold',
         },
     )
     reload_btn = html.Button(
-        '🔄 Reload',
+        'Reload',
         id='btn-reload-db',
         n_clicks=0,
-        style={'padding': '10px 20px', 'borderRadius': '6px', 'border': '1px solid #ccc', 'cursor': 'pointer'},
+        style={'padding': '8px 16px', 'borderRadius': '6px', 'border': '1px solid #ccc', 'cursor': 'pointer'},
     )
-    btn_row = html.Div([load_btn, reload_btn], style={'textAlign': 'center', 'marginBottom': '16px'})
-    # No startup auto-load — user clicks the button
-    startup_timer = dcc.Interval(id='startup-load', interval=99999999, n_intervals=0, max_intervals=0)
+    btn_row = html.Div([load_btn, reload_btn], style={'textAlign': 'center', 'marginBottom': '12px'})
+    startup_timer = dcc.Interval(id='startup-load', interval=1000, n_intervals=0, max_intervals=1)
     poll_timer = dcc.Interval(id='live-poll', interval=120000, n_intervals=0)
-
-    # ── Upload section ──────────────────────────────────────────────────────
-    accepted_hint = html.Div([
-        html.P('📋 Upload your own CSV dataset below', style={'fontWeight': 'bold', 'marginBottom': '4px'}),
-        html.P(
-            'Required columns: date, units_sold  |  '
-            'Optional: store_id, product_id, product_name, inventory_level, price, seasonality',
-            style={'fontSize': '12px', 'color': '#555', 'marginBottom': '8px'},
-        ),
-        html.P(
-            'Also accepts: Date, Store ID, Product ID, Inventory Level, Units Sold, Price, Seasonality',
-            style={'fontSize': '11px', 'color': '#888', 'marginBottom': '8px'},
-        ),
-    ], style={'textAlign': 'center', 'marginBottom': '6px'})
-
-    upload_zone = dcc.Upload(
-        id='upload-data',
-        children=html.Div([
-            html.Span('📁', style={'fontSize': '28px', 'display': 'block', 'marginBottom': '6px'}),
-            'Drag & Drop your CSV here, or ',
-            html.A('click to browse', style={'color': '#1565c0', 'fontWeight': 'bold'}),
-        ]),
-        style={
-            'width': '100%',
-            'padding': '22px 14px',
-            'borderWidth': '2px',
-            'borderStyle': 'dashed',
-            'borderRadius': '10px',
-            'borderColor': '#90caf9',
-            'backgroundColor': '#f0f7ff',
-            'textAlign': 'center',
-            'cursor': 'pointer',
-        },
-        multiple=False,
-    )
-    apply_btn = html.Button(
-        '✅ Apply Uploaded Dataset',
-        id='btn-apply-upload',
-        n_clicks=0,
-        disabled=True,
-        style={
-            'marginTop': '10px',
-            'padding': '10px 24px',
-            'borderRadius': '6px',
-            'border': '1px solid #1565c0',
-            'backgroundColor': '#1565c0',
-            'color': '#fff',
-            'fontWeight': 'bold',
-            'cursor': 'pointer',
-            'display': 'block',
-            'margin': '10px auto 0',
-        },
-    )
-    upload_box = html.Div(
-        [accepted_hint, upload_zone, apply_btn],
-        style={'width': '92%', 'maxWidth': '720px', 'margin': '0 auto 8px'},
-    )
-    # Preview table shown after file is dropped
-    preview_section = html.Div(id='upload-preview', style={'maxWidth': '960px', 'margin': '0 auto 12px', 'overflowX': 'auto'})
-    # ────────────────────────────────────────────────────────────────────────
-
-    status = html.Div(id='upload-status', style={'textAlign': 'center', 'margin': '8px', 'color': '#1b5e20', 'fontWeight': 'bold'})
-    store = dcc.Store(id='results-store')
-    pending_store = dcc.Store(id='pending-upload-store')  # holds parsed CSV before Apply
-    last_ct = dcc.Store(id='last-row-count', data=None)
-
     product_dd = dcc.Dropdown(
         id='product-filter',
         options=[{'label': 'All Products', 'value': 'ALL'}],
@@ -661,10 +584,30 @@ def make_layout():
         style={'width': '100%', 'maxWidth': '420px', 'margin': '0 auto'},
     )
     product_block = html.Div([
-        html.Label('Filter by Product', style={'fontWeight': 'bold', 'display': 'block', 'marginBottom': '6px'}),
+        html.Label('Product', style={'fontWeight': 'bold', 'display': 'block', 'marginBottom': '6px'}),
         product_dd,
     ], style={'maxWidth': '440px', 'margin': '0 auto 20px', 'textAlign': 'center'})
-
+    upload_box = html.Div(
+        style={'width': '92%', 'maxWidth': '720px', 'margin': '12px auto'},
+        children=[
+            dcc.Upload(
+                id='upload-data',
+                children=html.Div(['Drag and drop or ', html.A('select CSV')]),
+                style={
+                    'width': '100%',
+                    'padding': '14px',
+                    'borderWidth': '2px',
+                    'borderStyle': 'dashed',
+                    'borderRadius': '6px',
+                    'textAlign': 'center',
+                },
+                multiple=False,
+            ),
+        ],
+    )
+    status = html.Div(id='upload-status', style={'textAlign': 'center', 'margin': '8px', 'color': 'green'})
+    store = dcc.Store(id='results-store')
+    last_ct = dcc.Store(id='last-row-count', data=None)
     kpis = html.Div(
         id='kpi-row',
         style={
@@ -675,15 +618,15 @@ def make_layout():
             'margin': '16px auto',
         },
     )
-    g1 = dcc.Loading(dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}), type='circle')
-    g2 = dcc.Loading(dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}), type='circle')
+    g1 = dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
+    g2 = dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     perf_block = html.Div([
         html.H3('Model Performance (Actual vs Predicted)', style=GRAPH_SECTION_TITLE),
-        dcc.Loading(dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}), type='circle'),
+        dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     week_block = html.Div([
         html.H3('Next 7-Day Demand Forecast', style=GRAPH_SECTION_TITLE),
-        dcc.Loading(dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}), type='circle'),
+        dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     cal_wrap = html.Div([
         html.H3('Next 7-day forecast — exact values (table)', style=GRAPH_SECTION_TITLE),
@@ -695,17 +638,14 @@ def make_layout():
     ], style={'maxWidth': '720px', 'margin': '0 auto 32px'})
     return html.Div([
         hdr,
-        html.P('Real-time demand forecasting & reorder intelligence', style={'textAlign': 'center', 'color': '#666', 'marginBottom': '16px'}),
         btn_row,
         startup_timer,
         poll_timer,
+        product_block,
         upload_box,
-        preview_section,
         status,
         store,
-        pending_store,
         last_ct,
-        product_block,
         kpis,
         g1,
         g2,
@@ -723,48 +663,6 @@ def empty_after_failed_load(last_count):
     return ('', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
 
 
-# ── Callback 1: parse uploaded file → show preview + enable Apply button ────
-@app.callback(
-    Output('upload-preview', 'children'),
-    Output('pending-upload-store', 'data'),
-    Output('btn-apply-upload', 'disabled'),
-    Input('upload-data', 'contents'),
-    State('upload-data', 'filename'),
-    prevent_initial_call=True,
-)
-def on_file_dropped(contents, filename):
-    if contents is None:
-        raise PreventUpdate
-    _, b64 = contents.split(',')
-    raw = base64.b64decode(b64)
-    try:
-        df = pd.read_csv(io.StringIO(raw.decode('utf-8', errors='replace')))
-    except Exception as e:
-        return (html.P(f'❌ Cannot read file: {e}', style={'color': 'red', 'textAlign': 'center'}), None, True)
-
-    n_rows, n_cols = df.shape
-    preview_df = df.head(8)
-    th = {'padding': '6px 10px', 'backgroundColor': '#1565c0', 'color': '#fff',
-          'fontWeight': 'bold', 'fontSize': '12px', 'whiteSpace': 'nowrap'}
-    td = {'padding': '5px 10px', 'fontSize': '12px', 'borderBottom': '1px solid #eee', 'whiteSpace': 'nowrap'}
-    header = html.Tr([html.Th(c, style=th) for c in preview_df.columns])
-    body_rows = [html.Tr([html.Td(str(v), style=td) for v in row]) for _, row in preview_df.iterrows()]
-    tbl = html.Table(
-        [html.Thead(header), html.Tbody(body_rows)],
-        style={'borderCollapse': 'collapse', 'width': '100%', 'minWidth': '600px'},
-    )
-    preview = html.Div([
-        html.P(
-            f'📄 {filename}  —  {n_rows:,} rows × {n_cols} columns  (showing first 8 rows)',
-            style={'fontWeight': 'bold', 'textAlign': 'center', 'marginBottom': '6px', 'color': '#1565c0'},
-        ),
-        html.Div(tbl, style={'overflowX': 'auto', 'border': '1px solid #ddd', 'borderRadius': '6px', 'padding': '4px'}),
-    ])
-    # Store raw CSV text in pending store so Apply can process it
-    return (preview, {'csv_b64': b64, 'filename': filename}, False)
-
-
-# ── Callback 2: main data loader (default CSV / Apply upload / reload) ───────
 @app.callback(
     Output('upload-status', 'children'),
     Output('results-store', 'data'),
@@ -772,18 +670,36 @@ def on_file_dropped(contents, filename):
     Output('product-filter', 'value'),
     Output('product-filter', 'disabled'),
     Output('last-row-count', 'data'),
-    Input('btn-apply-upload', 'n_clicks'),
+    Input('upload-data', 'contents'),
     Input('btn-load-default', 'n_clicks'),
     Input('btn-reload-db', 'n_clicks'),
     Input('startup-load', 'n_intervals'),
     Input('live-poll', 'n_intervals'),
-    State('pending-upload-store', 'data'),
+    State('upload-data', 'filename'),
     State('last-row-count', 'data'),
     prevent_initial_call=True,
 )
-def on_data_in(n_apply, n_def, n_rel, _n_startup, n_live, pending, last_count):
+def on_data_in(contents, n_def, n_rel, _n_startup, n_live, filename, last_count):
     ctx = dash.callback_context
     who = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    if who == 'startup-load':
+        try:
+            df = load_data()
+        except Exception as e:
+            return (f'Startup load error: {e}', *empty_after_failed_load(None)[1:])
+        payload, err = build_payload_from_df(df, persist_forecasts=False)
+        if err:
+            return (err, None, *empty_after_failed_load(None)[2:])
+        opts = product_dropdown_options(payload)
+        try:
+            if CSV_SIMPLE.exists():
+                cnt = len(pd.read_csv(CSV_SIMPLE))
+            else:
+                cnt = None
+        except Exception:
+            cnt = None
+        return ('Loaded default dataset.', payload, opts, 'ALL', False, cnt)
 
     if who == 'live-poll':
         if not CSV_SIMPLE.exists():
@@ -795,55 +711,51 @@ def on_data_in(n_apply, n_def, n_rel, _n_startup, n_live, pending, last_count):
         if last_count is not None and cur == last_count:
             raise PreventUpdate
         df = load_data()
-        if len(df) > DEFAULT_SAMPLE_ROWS:
-            df = df.sort_values(DATE).tail(DEFAULT_SAMPLE_ROWS)
         payload, err = build_payload_from_df(df, persist_forecasts=False)
         if err:
             raise PreventUpdate
         opts = product_dropdown_options(payload)
         return (f'Auto-refreshed ({cur} rows in CSV).', payload, opts, 'ALL', False, cur)
 
-    if who in ('btn-load-default', 'btn-reload-db', 'startup-load'):
+    if who in ('btn-load-default', 'btn-reload-db'):
         try:
             df = load_data()
         except Exception as e:
-            return (f'❌ Load error: {e}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        # Sample to keep it fast
-        if len(df) > DEFAULT_SAMPLE_ROWS:
-            df = df.sort_values(DATE).tail(DEFAULT_SAMPLE_ROWS)
+            return (f'Load error: {e}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        save_db = who == 'btn-load-default'
+        payload, err = build_payload_from_df(df, persist_forecasts=save_db)
+        if err:
+            return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        opts = product_dropdown_options(payload)
+        msg = 'Loaded data.'
+        if save_db:
+            msg += ' Predictions saved to database.'
+        try:
+            if CSV_SIMPLE.exists():
+                cnt = len(pd.read_csv(CSV_SIMPLE))
+            else:
+                cnt = last_count
+        except Exception:
+            cnt = last_count
+        return (msg, payload, opts, 'ALL', False, cnt)
+
+    if who == 'upload-data':
+        if contents is None:
+            raise PreventUpdate
+        _, b64 = contents.split(',')
+        raw = base64.b64decode(b64)
+        try:
+            df = pd.read_csv(io.StringIO(raw.decode('utf-8')))
+        except Exception:
+            return ('Error reading file.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        df = ensure_training_columns(df)
+        if STORE_ID not in df.columns:
+            return ('CSV must include store_id.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
         payload, err = build_payload_from_df(df, persist_forecasts=False)
         if err:
             return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
         opts = product_dropdown_options(payload)
-        try:
-            cnt = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0]) if CSV_SIMPLE.exists() else last_count
-        except Exception:
-            cnt = last_count
-        return (f'✅ Default dataset loaded ({len(df):,} rows).', payload, opts, 'ALL', False, cnt)
-
-    if who == 'btn-apply-upload':
-        if not pending:
-            raise PreventUpdate
-        try:
-            raw = base64.b64decode(pending['csv_b64'])
-            df = pd.read_csv(io.StringIO(raw.decode('utf-8', errors='replace')))
-        except Exception as e:
-            return (f'❌ Error reading file: {e}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        df = ensure_training_columns(df)
-        if STORE_ID not in df.columns:
-            df[STORE_ID] = 'store_1'
-        if PRODUCT_ID not in df.columns and 'product' in df.columns:
-            df = df.rename(columns={'product': PRODUCT_ID})
-        if PRODUCT_ID not in df.columns:
-            df[PRODUCT_ID] = df.index.astype(str)
-        if len(df) > DEFAULT_SAMPLE_ROWS:
-            df = df.sort_values(DATE, errors='ignore').tail(DEFAULT_SAMPLE_ROWS)
-        payload, err = build_payload_from_df(df, persist_forecasts=False)
-        if err:
-            return (f'❌ {err}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
-        opts = product_dropdown_options(payload)
-        fname = pending.get('filename', 'file')
-        return (f"✅ '{fname}' applied ({len(df):,} rows).", payload, opts, 'ALL', False, last_count)
+        return (f"File '{filename}' processed.", payload, opts, 'ALL', False, last_count)
 
     raise PreventUpdate
 
