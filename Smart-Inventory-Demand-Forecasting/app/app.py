@@ -615,35 +615,81 @@ def make_layout():
     status = html.Div(id='upload-status', style={'textAlign': 'center', 'margin': '8px', 'color': 'green'})
     store = dcc.Store(id='results-store')
     last_ct = dcc.Store(id='last-row-count', data=None)
-    kpis = html.Div(
-        id='kpi-row',
+
+    # ⏳ Processing animation — shown while results-store is being populated
+    processing_banner = html.Div(
+        id='processing-banner',
+        children='⏳ Processing data, please wait...',
         style={
-            'display': 'flex',
-            'flexWrap': 'wrap',
-            'justifyContent': 'center',
-            'maxWidth': '1100px',
-            'margin': '16px auto',
+            'display': 'none',
+            'textAlign': 'center',
+            'padding': '12px',
+            'margin': '8px auto',
+            'maxWidth': '500px',
+            'backgroundColor': '#fff8e1',
+            'border': '1px solid #f9a825',
+            'borderRadius': '8px',
+            'color': '#e65100',
+            'fontWeight': 'bold',
+            'fontSize': '15px',
+            'animation': 'pulse 1.2s infinite',
         },
     )
-    g1 = dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
-    g2 = dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
+    # Inject CSS keyframe animation via a style tag
+    anim_style = html.Style("""
+        @keyframes pulse {
+            0%   { opacity: 1; }
+            50%  { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+    """)
+
+    kpis = dcc.Loading(
+        html.Div(
+            id='kpi-row',
+            style={
+                'display': 'flex',
+                'flexWrap': 'wrap',
+                'justifyContent': 'center',
+                'maxWidth': '1100px',
+                'margin': '16px auto',
+            },
+        ),
+        type='dot',
+        color='#2e7d32',
+    )
+    g1 = dcc.Loading(
+        dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}),
+        type='circle', color='#1565c0',
+    )
+    g2 = dcc.Loading(
+        dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}),
+        type='circle', color='#1565c0',
+    )
     perf_block = html.Div([
         html.H3('Model Performance (Actual vs Predicted)', style=GRAPH_SECTION_TITLE),
-        dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
+        dcc.Loading(
+            dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
+            type='circle', color='#1565c0',
+        ),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     week_block = html.Div([
         html.H3('Next 7-Day Demand Forecast', style=GRAPH_SECTION_TITLE),
-        dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
+        dcc.Loading(
+            dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
+            type='circle', color='#1565c0',
+        ),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     cal_wrap = html.Div([
         html.H3('Next 7-day forecast — exact values (table)', style=GRAPH_SECTION_TITLE),
-        html.Div(id='calendar-forecast-table'),
+        dcc.Loading(html.Div(id='calendar-forecast-table'), type='dot'),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     reorder_wrap = html.Div([
         html.H3('Reorder alerts', style={'textAlign': 'center', 'marginBottom': '12px'}),
-        html.Div(id='reorder-table'),
+        dcc.Loading(html.Div(id='reorder-table'), type='dot'),
     ], style={'maxWidth': '720px', 'margin': '0 auto 32px'})
     return html.Div([
+        anim_style,
         hdr,
         btn_row,
         startup_timer,
@@ -651,6 +697,7 @@ def make_layout():
         product_block,
         upload_box,
         status,
+        processing_banner,
         store,
         last_ct,
         kpis,
@@ -668,6 +715,42 @@ app.layout = make_layout()
 
 def empty_after_failed_load(last_count):
     return ('', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+
+
+@app.callback(
+    Output('processing-banner', 'style'),
+    Input('btn-load-default', 'n_clicks'),
+    Input('btn-reload-db', 'n_clicks'),
+    Input('startup-load', 'n_intervals'),
+    Input('upload-data', 'contents'),
+    Input('results-store', 'data'),
+    prevent_initial_call=True,
+)
+def toggle_processing_banner(n_def, n_rel, _n_start, _upload, _data):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+    who = ctx.triggered[0]['prop_id'].split('.')[0]
+    _SHOW = {
+        'display': 'block',
+        'textAlign': 'center',
+        'padding': '12px',
+        'margin': '8px auto',
+        'maxWidth': '500px',
+        'backgroundColor': '#fff8e1',
+        'border': '1px solid #f9a825',
+        'borderRadius': '8px',
+        'color': '#e65100',
+        'fontWeight': 'bold',
+        'fontSize': '15px',
+        'animation': 'pulse 1.2s infinite',
+    }
+    _HIDE = {'display': 'none'}
+    # Show when a load action is triggered, hide when results-store is updated
+    if who == 'results-store':
+        return _HIDE
+    return _SHOW
+
 
 
 @app.callback(
