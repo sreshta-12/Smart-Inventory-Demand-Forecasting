@@ -15,8 +15,8 @@ forecast/
 *.egg-info/
 
 # Data & Models
-# *.csv
-# *.joblib
+*.csv
+*.joblib
 *.pkl
 
 # OS

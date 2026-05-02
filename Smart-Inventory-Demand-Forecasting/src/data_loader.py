@@ -13,6 +13,9 @@ LEGACY_INVENTORY_SQL = 'SELECT * FROM inventory ORDER BY "Date", "Product ID"'
 
 
 def load_data():
+    if CSV_SIMPLE.exists():
+        return _load_from_csv()
+
     if not SQLITE_PATH.exists():
         return _load_from_csv()
 

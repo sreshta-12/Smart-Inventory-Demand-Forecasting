@@ -1,8 +1,7 @@
 import base64
 import io
 import sys
-import threading
-import time
+import traceback
 from pathlib import Path
 
 import dash
@@ -38,49 +37,14 @@ from src.reorder import DEFAULT_LEAD_TIME_DAYS
 
 model, scaler, feature_cols, scaled_columns = load_artifacts()
 
-FORECAST_TAIL_PER_SERIES = 200     # rows per group shown in dashboard charts
-FORECAST_MAX_GROUPS = 3            # max groups for 7-day forecast (speed: 3×7=21 model calls)
+FORECAST_TAIL_PER_SERIES = 200
+FORECAST_MAX_GROUPS = 100
 HISTORY_DAYS_ON_FORECAST_CHART = 120
 DASHBOARD_RECORDS_HISTORY_DAYS = 200
-_ML_ROWS_PER_GROUP = 180           # rows per group fed to ML (keeps stats stable)
 RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PRODUCT_NAME, PRICE, SEASONALITY]
-
-# ── Background computation cache ──────────────────────────────────────────
-# Runs the heavy ML pipeline in a background daemon thread so the
-# Gunicorn worker timeout (30 s) is never hit by a Dash callback.
-_payload_cache: dict = {'status': 'idle', 'payload': None, 'msg': '', 't_start': 0.0}
-_cache_lock = threading.Lock()
-
-
-def _compute_and_cache(df_override=None, label='default dataset'):
-    """Run load_data + build_payload in background; store result in _payload_cache."""
-    t0 = time.time()
-    with _cache_lock:
-        _payload_cache.update({'status': 'running', 'payload': None,
-                               'msg': f'⏳ Processing {label}…', 't_start': t0})
-    try:
-        df = df_override if df_override is not None else load_data()
-        payload, err = build_payload_from_df(df, persist_forecasts=False)
-        elapsed = time.time() - t0
-        with _cache_lock:
-            if err:
-                _payload_cache.update({'status': 'error', 'msg': f'❌ {err}'})
-            else:
-                _payload_cache.update({
-                    'status': 'done', 'payload': payload,
-                    'msg': f'✅ Loaded {label} in {elapsed:.1f}s',
-                })
-    except Exception as exc:
-        with _cache_lock:
-            _payload_cache.update({'status': 'error', 'msg': f'❌ Error: {exc}'})
-
-
-# Kick off background load the moment the module is imported
-threading.Thread(target=_compute_and_cache, daemon=True).start()
 
 app = dash.Dash(__name__)
 app.title = 'Inventory Demand Forecasting'
-server = app.server
 
 CARD_STYLE = {
     'flex': '1',
@@ -118,35 +82,37 @@ def json_for_json_store(val):
 
 def dates_as_strings(series):
     t = pd.to_datetime(series, errors='coerce')
-    return [x.strftime('%Y-%m-%d') if pd.notna(x) else '' for x in t]
+    out = []
+    for x in t:
+        out.append(x.strftime('%Y-%m-%d') if pd.notna(x) else '')
+    return out
 
 
 def nums_as_plain_list(series):
-    arr = pd.to_numeric(series, errors='coerce').values.astype(float)
-    return [None if (v != v or not np.isfinite(v)) else float(v) for v in arr]
+    arr = np.asarray(pd.to_numeric(series, errors='coerce'), dtype=float)
+    plain = []
+    for v in arr.flat:
+        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+            plain.append(None)
+        else:
+            plain.append(float(v))
+    return plain
 
 
 def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
-    df = ensure_training_columns(df.copy())
-    # Cap rows per group BEFORE ML to control runtime while keeping stats stable.
-    # _ML_ROWS_PER_GROUP rows gives enough history for lag features + reorder stats.
-    df[DATE] = pd.to_datetime(df[DATE], errors='coerce')
-    df = (
-        df.sort_values(DATE)
-          .groupby([STORE_ID, PRODUCT_ID], group_keys=False)
-          .tail(_ML_ROWS_PER_GROUP)
-          .reset_index(drop=True)
-    )
-    slice_scored, _df_out = run_batch_predict(
-        df, model, scaler, feature_cols, scaled_columns,
+    df_in = ensure_training_columns(df.copy())
+    slice_scored, full_timeline = run_batch_predict(
+        df_in, model, scaler, feature_cols, scaled_columns,
         lead_time_days=DEFAULT_LEAD_TIME_DAYS,
         persist_db=persist_forecasts,
     )
+    if full_timeline.empty:
+        return (None, 'Not enough complete rows after feature engineering (lags require history).')
     if slice_scored.empty:
         return (None, 'Not enough complete rows after feature engineering (lags require history).')
 
-    n_products_full = int(slice_scored[PRODUCT_ID].nunique())
-    show = slice_scored.copy()
+    n_products_full = int(df_in[PRODUCT_ID].nunique())
+    show = full_timeline.copy()
     show[DATE] = pd.to_datetime(show[DATE], errors='coerce')
     show = show.dropna(subset=[DATE])
     last_day = show[DATE].max()
@@ -187,11 +153,15 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
                 calendar_forecast_agg.append(rr)
 
     if INVENTORY_LEVEL in show.columns:
-        inv_vals = show[INVENTORY_LEVEL]
+        inv_col = INVENTORY_LEVEL
+        inv_vals = show[inv_col]
     else:
         inv_vals = 0
 
-    names = show[PRODUCT_NAME].astype(str) if PRODUCT_NAME in show.columns else show[PRODUCT_ID].astype(str)
+    if PRODUCT_NAME in show.columns:
+        names = show[PRODUCT_NAME].astype(str)
+    else:
+        names = show[PRODUCT_ID].astype(str)
 
     out_df = pd.DataFrame({
         STORE_ID: show[STORE_ID].astype(str),
@@ -209,8 +179,6 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
     dmin = pd.to_datetime(out_df[DATE], errors='coerce').min()
     dmax = pd.to_datetime(out_df[DATE], errors='coerce').max()
 
-    # Safe per-row serialisation — converts numpy types to plain Python
-    # (required for REORDER_POINT/INVENTORY_LEVEL to compute correctly later)
     table_records = []
     for r in out_df.to_dict('records'):
         row = {k: json_for_json_store(v) for k, v in r.items()}
@@ -220,7 +188,7 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
 
     meta = {
         'n_products': n_products_full,
-        'product_ids': sorted(slice_scored[PRODUCT_ID].astype(str).unique().tolist()),
+        'product_ids': sorted(df_in[PRODUCT_ID].astype(str).unique().tolist()),
         'date_min': str(dmin.date()) if pd.notna(dmin) else None,
         'date_max': str(dmax.date()) if pd.notna(dmax) else None,
         'forecast_horizon_days': FORECAST_HORIZON_DAYS,
@@ -252,6 +220,53 @@ def reorder_gap_units(snap: pd.DataFrame) -> int:
     rop = pd.to_numeric(snap[REORDER_POINT], errors='coerce').fillna(0.0)
     gap = (rop - inv).clip(lower=0.0)
     return int(np.rint(float(gap.sum())))
+
+
+def _slice_reorder_window(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    d = df.copy()
+    d[DATE] = pd.to_datetime(d[DATE], errors='coerce')
+    d = d.dropna(subset=[DATE])
+    if d.empty:
+        return d
+    last = d[DATE].max()
+    d = d[d[DATE] > last - pd.Timedelta(days=15)]
+    if pd.Timestamp(last).day == 1:
+        d = d[d[DATE] < last]
+    if d.empty:
+        return d
+    if STORE_ID in d.columns:
+        keys = [STORE_ID, PRODUCT_ID]
+    else:
+        keys = [PRODUCT_ID]
+    d = d.sort_values([*keys, DATE]).groupby(keys, group_keys=False).tail(14)
+    d = d.sort_values(DATE)
+    if PREDICTED_DEMAND in d.columns and REORDER_POINT in d.columns:
+        pred = pd.to_numeric(d[PREDICTED_DEMAND], errors='coerce')
+        rop = pd.to_numeric(d[REORDER_POINT], errors='coerce')
+        d = d.loc[pred.notna() & rop.notna()].copy()
+    return d
+
+
+def reorder_gap_units_window(df: pd.DataFrame) -> int:
+    if df.empty or REORDER_POINT not in df.columns or INVENTORY_LEVEL not in df.columns:
+        return 0
+    d = _slice_reorder_window(df)
+    if d.empty:
+        return 0
+    inv = pd.to_numeric(d[INVENTORY_LEVEL], errors='coerce').fillna(0.0)
+    rop = pd.to_numeric(d[REORDER_POINT], errors='coerce').fillna(0.0)
+    gap = (rop - inv).clip(lower=0.0)
+    d = d.assign(_gap=gap)
+    if STORE_ID in d.columns:
+        per_series_worst = d.groupby([STORE_ID, PRODUCT_ID], observed=False)['_gap'].max()
+    else:
+        per_series_worst = d.groupby(PRODUCT_ID, observed=False)['_gap'].max()
+    tot = float(per_series_worst.sum())
+    if not np.isfinite(tot):
+        tot = 0.0
+    return int(np.rint(tot))
 
 
 def filter_by_product(df: pd.DataFrame, product_value: str) -> pd.DataFrame:
@@ -397,25 +412,28 @@ def chart_next_week(raw_records: list | None, product_value: str, precomputed_ca
     leg = layout_with_legend_at_bottom()
     pv = product_value or 'ALL'
     cal = None
-    # Always try precomputed first; only fall back to live inference for single products
-    if precomputed_cal_records:
+    if pv == 'ALL' and precomputed_cal_records:
         cal = pd.DataFrame(precomputed_cal_records)
         if not cal.empty and 'forecast_date' in cal.columns:
             cal = cal.copy()
             cal['forecast_date'] = pd.to_datetime(cal['forecast_date'], errors='coerce')
             cal = cal.dropna(subset=['forecast_date'])
-        else:
-            cal = None
-    if (cal is None or cal.empty) and pv != 'ALL':
+    if cal is None or cal.empty:
         raw_df = raw_slice_to_df(raw_records, pv)
         cal = seven_day_forecast_table(raw_df)
     if cal is None or cal.empty:
         fig.update_layout(**leg, height=440)
         return fig
     cal = cal.copy()
-    cal['forecast_date'] = pd.to_datetime(cal['forecast_date'])
-    mean = np.rint(cal['mean_predicted_demand'].astype(float)).astype(int)
-    std = cal.get('std_predicted_demand', pd.Series(0.0, index=cal.index)).astype(float).fillna(0)
+    cal['forecast_date'] = pd.to_datetime(cal['forecast_date'], errors='coerce')
+    cal = cal.dropna(subset=['forecast_date'])
+    if cal.empty:
+        fig.update_layout(**leg, height=440)
+        return fig
+    md = pd.to_numeric(cal['mean_predicted_demand'], errors='coerce').fillna(0.0)
+    mean = np.rint(np.clip(md, 0, 1e12)).astype(int)
+    std = cal.get('std_predicted_demand', pd.Series(0.0, index=cal.index))
+    std = pd.to_numeric(std, errors='coerce').astype(float).fillna(0.0).clip(0, 1e12)
     upper = np.rint(mean + 1.96 * std).astype(int)
     lower = np.maximum(np.rint(mean - 1.96 * std).astype(int), 0)
     xd = dates_as_strings(cal['forecast_date'])
@@ -519,13 +537,9 @@ def calendar_table_block(cal_df: pd.DataFrame | None, *, product_scope: str) -> 
 def reorder_table_html(df: pd.DataFrame) -> html.Div:
     if df.empty:
         return html.P('No data.', style={'textAlign': 'center', 'color': '#666'})
-    d = df.copy()
-    d[DATE] = pd.to_datetime(d[DATE], errors='coerce')
-    d = d.dropna(subset=[DATE])
-    last = d[DATE].max()
-    d = d[d[DATE] > last - pd.Timedelta(days=14)]
-    d = d.sort_values([STORE_ID, PRODUCT_ID, DATE]).groupby([STORE_ID, PRODUCT_ID], group_keys=False).tail(14)
-    d = d.sort_values(DATE)
+    d = _slice_reorder_window(df)
+    if d.empty:
+        return html.P('No data.', style={'textAlign': 'center', 'color': '#666'})
     if REORDER_POINT not in d.columns:
         d[REORDER_POINT] = np.nan
     th_style = {
@@ -547,8 +561,10 @@ def reorder_table_html(df: pd.DataFrame) -> html.Div:
             acolor = '#c62828'
         else:
             acolor = '#1b5e20'
+        ra = row.get(REORDER_ALERT, '')
+        alert_txt = '—' if pd.isna(ra) or str(ra) in ('nan', 'None') else str(ra)
         alert_cell = html.Td(
-            str(row.get(REORDER_ALERT, '')),
+            alert_txt,
             style={
                 'padding': '8px 12px',
                 'color': acolor,
@@ -562,7 +578,8 @@ def reorder_table_html(df: pd.DataFrame) -> html.Div:
             ds = row[DATE].strftime('%Y-%m-%d')
         else:
             ds = ''
-        inv_txt = f'{float(row[INVENTORY_LEVEL]):,.0f}'
+        inv_raw = pd.to_numeric(row.get(INVENTORY_LEVEL), errors='coerce')
+        inv_txt = f'{float(inv_raw):,.0f}' if pd.notna(inv_raw) else '—'
         if pd.notna(row.get(PREDICTED_DEMAND)):
             pred_txt = f'{int(round(float(row[PREDICTED_DEMAND])))}'
         else:
@@ -625,10 +642,8 @@ def make_layout():
         style={'padding': '8px 16px', 'borderRadius': '6px', 'border': '1px solid #ccc', 'cursor': 'pointer'},
     )
     btn_row = html.Div([load_btn, reload_btn], style={'textAlign': 'center', 'marginBottom': '12px'})
-    # startup-load fires once after 1 s to check if background compute is done
-    startup_timer = dcc.Interval(id='startup-load', interval=1000, n_intervals=0, max_intervals=1)
-    # cache-poll fires every 2 s while background thread is running
-    cache_poll = dcc.Interval(id='cache-poll', interval=2000, n_intervals=0, disabled=False)
+    startup_timer = dcc.Interval(id='startup-load', interval=1, n_intervals=0, max_intervals=1)
+    poll_timer = dcc.Interval(id='live-poll', interval=20000, n_intervals=0)
     product_dd = dcc.Dropdown(
         id='product-filter',
         options=[{'label': 'All Products', 'value': 'ALL'}],
@@ -661,56 +676,39 @@ def make_layout():
     status = html.Div(id='upload-status', style={'textAlign': 'center', 'margin': '8px', 'color': 'green'})
     store = dcc.Store(id='results-store')
     last_ct = dcc.Store(id='last-row-count', data=None)
-
-    kpis = dcc.Loading(
-        html.Div(
-            id='kpi-row',
-            style={
-                'display': 'flex',
-                'flexWrap': 'wrap',
-                'justifyContent': 'center',
-                'maxWidth': '1100px',
-                'margin': '16px auto',
-            },
-        ),
-        type='dot',
-        color='#2e7d32',
+    kpis = html.Div(
+        id='kpi-row',
+        style={
+            'display': 'flex',
+            'flexWrap': 'wrap',
+            'justifyContent': 'center',
+            'maxWidth': '1100px',
+            'margin': '16px auto',
+        },
     )
-    g1 = dcc.Loading(
-        dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}),
-        type='circle', color='#1565c0',
-    )
-    g2 = dcc.Loading(
-        dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'}),
-        type='circle', color='#1565c0',
-    )
+    g1 = dcc.Graph(id='graph-sales-trend', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
+    g2 = dcc.Graph(id='graph-inventory-levels', style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     perf_block = html.Div([
         html.H3('Model Performance (Actual vs Predicted)', style=GRAPH_SECTION_TITLE),
-        dcc.Loading(
-            dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
-            type='circle', color='#1565c0',
-        ),
+        dcc.Graph(id='graph-demand-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     week_block = html.Div([
         html.H3('Next 7-Day Demand Forecast', style=GRAPH_SECTION_TITLE),
-        dcc.Loading(
-            dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
-            type='circle', color='#1565c0',
-        ),
+        dcc.Graph(id='graph-next-7-forecast', style={'maxWidth': '1000px', 'margin': '0 auto 8px'}),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     cal_wrap = html.Div([
         html.H3('Next 7-day forecast — exact values (table)', style=GRAPH_SECTION_TITLE),
-        dcc.Loading(html.Div(id='calendar-forecast-table'), type='dot'),
+        html.Div(id='calendar-forecast-table'),
     ], style={'maxWidth': '1000px', 'margin': '0 auto 24px'})
     reorder_wrap = html.Div([
         html.H3('Reorder alerts', style={'textAlign': 'center', 'marginBottom': '12px'}),
-        dcc.Loading(html.Div(id='reorder-table'), type='dot'),
+        html.Div(id='reorder-table'),
     ], style={'maxWidth': '720px', 'margin': '0 auto 32px'})
     return html.Div([
         hdr,
         btn_row,
         startup_timer,
-        cache_poll,
+        poll_timer,
         product_block,
         upload_box,
         status,
@@ -740,71 +738,92 @@ def empty_after_failed_load(last_count):
     Output('product-filter', 'value'),
     Output('product-filter', 'disabled'),
     Output('last-row-count', 'data'),
-    Output('cache-poll', 'disabled'),
-    Input('cache-poll', 'n_intervals'),
-    Input('startup-load', 'n_intervals'),
+    Input('upload-data', 'contents'),
     Input('btn-load-default', 'n_clicks'),
     Input('btn-reload-db', 'n_clicks'),
-    Input('upload-data', 'contents'),
+    Input('startup-load', 'n_intervals'),
+    Input('live-poll', 'n_intervals'),
     State('upload-data', 'filename'),
     State('last-row-count', 'data'),
     prevent_initial_call=True,
 )
-def on_data_in(n_poll, _n_start, n_def, n_rel, contents, filename, last_count):
+def on_data_in(contents, n_def, n_rel, _n_startup, n_live, filename, last_count):
     ctx = dash.callback_context
     who = ctx.triggered[0]['prop_id'].split('.')[0]
-    _NO = dash.no_update  # partial-update sentinel
 
-    # ── Polling: check background cache ──────────────────────────────────
-    if who in ('cache-poll', 'startup-load'):
-        with _cache_lock:
-            status = _payload_cache['status']
-            msg    = _payload_cache['msg']
-            payload = _payload_cache.get('payload')
-            t0      = _payload_cache.get('t_start', time.time())
-
-        elapsed = time.time() - t0
-
-        if status == 'done' and payload is not None:
-            opts = product_dropdown_options(payload)
-            try:
-                cnt = int(pd.read_csv(CSV_SIMPLE, usecols=[0]).shape[0]) if CSV_SIMPLE.exists() else None
-            except Exception:
+    if who == 'startup-load':
+        try:
+            df = load_data()
+        except Exception as e:
+            return (f'Startup load error: {e}', *empty_after_failed_load(None)[1:])
+        payload, err = build_payload_from_df(df, persist_forecasts=False)
+        if err:
+            return (err, None, *empty_after_failed_load(None)[2:])
+        opts = product_dropdown_options(payload)
+        try:
+            if CSV_SIMPLE.exists():
+                cnt = len(pd.read_csv(CSV_SIMPLE))
+            else:
                 cnt = None
-            return (msg, payload, opts, 'ALL', False, cnt, True)  # True = stop polling
+        except Exception:
+            cnt = None
+        return ('Loaded default dataset.', payload, opts, 'ALL', False, cnt)
 
-        if status == 'error':
-            return (msg, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, None, True)
+    if who == 'live-poll':
+        if not CSV_SIMPLE.exists():
+            raise PreventUpdate
+        try:
+            cur = len(pd.read_csv(CSV_SIMPLE))
+        except Exception:
+            raise PreventUpdate
+        if last_count is not None and cur == last_count:
+            raise PreventUpdate
+        df = load_data()
+        payload, err = build_payload_from_df(df, persist_forecasts=True)
+        if err:
+            raise PreventUpdate
+        opts = product_dropdown_options(payload)
+        return (f'Auto-refreshed ({cur} rows in CSV).', payload, opts, 'ALL', False, cur)
 
-        # Still running — update status text only, keep everything else unchanged
-        live_msg = f'⏳ Processing… {elapsed:.0f}s elapsed (model running in background)'
-        return (live_msg, _NO, _NO, _NO, _NO, _NO, False)  # keep polling
-
-    # ── Button: kick off a new background computation ──────────────────
     if who in ('btn-load-default', 'btn-reload-db'):
-        with _cache_lock:
-            if _payload_cache['status'] == 'running':
-                return ('⏳ Already processing, please wait…', _NO, _NO, _NO, _NO, _NO, False)
-        # Start fresh background computation
-        threading.Thread(target=_compute_and_cache, daemon=True).start()
-        return ('⏳ Processing started… dashboard will update automatically.', _NO, _NO, _NO, _NO, _NO, False)
+        try:
+            df = load_data()
+        except Exception as e:
+            return (f'Load error: {e}', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        save_db = who == 'btn-load-default'
+        payload, err = build_payload_from_df(df, persist_forecasts=save_db)
+        if err:
+            return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        opts = product_dropdown_options(payload)
+        msg = 'Loaded data.'
+        if save_db:
+            msg += ' Predictions saved to database.'
+        try:
+            if CSV_SIMPLE.exists():
+                cnt = len(pd.read_csv(CSV_SIMPLE))
+            else:
+                cnt = last_count
+        except Exception:
+            cnt = last_count
+        return (msg, payload, opts, 'ALL', False, cnt)
 
-    # ── Upload: parse CSV then run in background ─────────────────────
     if who == 'upload-data':
         if contents is None:
             raise PreventUpdate
         _, b64 = contents.split(',')
+        raw = base64.b64decode(b64)
         try:
-            df_up = pd.read_csv(io.StringIO(base64.b64decode(b64).decode('utf-8', errors='replace')))
-        except Exception as exc:
-            return (f'❌ Cannot read file: {exc}', _NO, _NO, _NO, _NO, _NO, _NO)
-        df_up = ensure_training_columns(df_up)
-        if STORE_ID not in df_up.columns:
-            df_up[STORE_ID] = 'store_1'
-        lbl = f"file '{filename}'"
-        threading.Thread(target=_compute_and_cache, args=(df_up, lbl), daemon=True).start()
-        return (f"⏳ Processing '{filename}'… dashboard will update automatically.",
-                _NO, _NO, _NO, _NO, _NO, False)
+            df = pd.read_csv(io.StringIO(raw.decode('utf-8')))
+        except Exception:
+            return ('Error reading file.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        df = ensure_training_columns(df)
+        if STORE_ID not in df.columns:
+            return ('CSV must include store_id.', None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        payload, err = build_payload_from_df(df, persist_forecasts=False)
+        if err:
+            return (err, None, [{'label': 'All Products', 'value': 'ALL'}], 'ALL', True, last_count)
+        opts = product_dropdown_options(payload)
+        return (f"File '{filename}' processed.", payload, opts, 'ALL', False, last_count)
 
     raise PreventUpdate
 
@@ -821,7 +840,7 @@ def kpi_row_placeholder():
             html.Div('—', style={'fontSize': '22px', 'fontWeight': 'bold'}),
         ], style=c),
         html.Div([
-            html.Div('Reorder needed (units)', style={'fontSize': '13px', 'color': '#666'}),
+            html.Div('Reorder needed', style={'fontSize': '13px', 'color': '#666'}),
             html.Div('—', style={'fontSize': '22px', 'fontWeight': 'bold'}),
         ], style=c),
         html.Div([
@@ -829,6 +848,19 @@ def kpi_row_placeholder():
             html.Div('—', style={'fontSize': '22px', 'fontWeight': 'bold'}),
         ], style=c),
     ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'center'})
+
+
+def _error_figure(message: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(
+        x=0.5, y=0.5, xref='paper', yref='paper', text=str(message),
+        showarrow=False, font=dict(color='#b71c1c', size=12),
+    )
+    fig.update_layout(
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        height=400, margin=dict(t=30, b=30),
+    )
+    return fig
 
 
 @app.callback(
@@ -876,6 +908,27 @@ def on_product_view(product_value, data):
             calendar_table_block(None, product_scope=product_value or 'ALL'),
         )
 
+    try:
+        return _build_product_dashboard(product_value, data, df, df_full)
+    except Exception as e:
+        traceback.print_exc()
+        ef = _error_figure(str(e))
+        err_kpi = html.Div([
+            empty_kpis,
+            html.P(
+                f'Dashboard error: {e}',
+                style={'color': '#b71c1c', 'textAlign': 'center', 'maxWidth': '900px', 'margin': '8px auto 0'},
+            ),
+        ], style={'display': 'flex', 'flexDirection': 'column', 'alignItems': 'center', 'width': '100%'})
+        return (
+            err_kpi,
+            ef, ef, ef, ef,
+            html.P('—', style={'textAlign': 'center'}),
+            html.P('—', style={'textAlign': 'center', 'color': '#666'}),
+        )
+
+
+def _build_product_dashboard(product_value, data, df, df_full):
     meta = data.get('meta') or {}
     n_products = int(meta.get('n_products') or df_full[PRODUCT_ID].nunique())
     if product_value and product_value != 'ALL':
@@ -889,25 +942,28 @@ def on_product_view(product_value, data):
         sales_30 = float('nan')
 
     snap = df[df[DATE] == dmax]
-    reorder_needed_units = reorder_gap_units(snap)
+    reorder_needed_units = reorder_gap_units_window(df)
     pv = product_value or 'ALL'
+    raw_for_kpi = raw_slice_to_df(data.get('raw_slice'), pv)
 
-    # Use precomputed calendar — avoid expensive re-inference on every product switch
     cal_tbl = None
-    if data.get('calendar_forecast_agg'):
+    if pv == 'ALL' and data.get('calendar_forecast_agg'):
         cal_tbl = pd.DataFrame(data['calendar_forecast_agg'])
-    # Never re-run ML per product — use precomputed forecast for all views
-
+    if cal_tbl is None or cal_tbl.empty:
+        cal_tbl = seven_day_forecast_table(raw_for_kpi)
 
     pred_7d = 0
     try:
         if cal_tbl is not None and cal_tbl['mean_predicted_demand'].notna().any():
-            pred_7d = int(np.rint(cal_tbl['mean_predicted_demand'].astype(float).fillna(0).sum()))
+            ps = float(cal_tbl['mean_predicted_demand'].astype(float).fillna(0).sum())
+            pred_7d = int(np.rint(ps)) if np.isfinite(ps) else 0
         elif not snap.empty:
-            pred_7d = int(np.rint(float(pd.to_numeric(snap[PREDICTED_DEMAND], errors='coerce').fillna(0).sum())))
+            ps = float(pd.to_numeric(snap[PREDICTED_DEMAND], errors='coerce').fillna(0).sum())
+            pred_7d = int(np.rint(ps)) if np.isfinite(ps) else 0
     except Exception:
         if not snap.empty:
-            pred_7d = int(np.rint(float(pd.to_numeric(snap[PREDICTED_DEMAND], errors='coerce').fillna(0).sum())))
+            ps = float(pd.to_numeric(snap[PREDICTED_DEMAND], errors='coerce').fillna(0).sum())
+            pred_7d = int(np.rint(ps)) if np.isfinite(ps) else 0
 
     c = CARD_STYLE
     if sales_30 == sales_30:
@@ -929,7 +985,7 @@ def on_product_view(product_value, data):
             html.Div(sales_txt, style={'fontSize': '22px', 'fontWeight': 'bold'}),
         ], style=c),
         html.Div([
-            html.Div('Reorder needed (units)', style={'fontSize': '13px', 'color': '#666'}),
+            html.Div('Reorder needed', style={'fontSize': '13px', 'color': '#666'}),
             html.Div(f'{reorder_needed_units:,}', style={'fontSize': '22px', 'fontWeight': 'bold', 'color': rcolor}),
         ], style=c),
         html.Div([
@@ -941,9 +997,10 @@ def on_product_view(product_value, data):
     fig_sales = chart_sales_trend(df)
     fig_inv = chart_inventory_bars(df)
     fig_perf = chart_actual_vs_pred(df)
-    # Pass precomputed data always; chart_next_week will use it for ALL and
-    # fall back to per-product raw_slice only when the precomputed list is absent.
-    pre_cal = data.get('calendar_forecast_agg')
+    if pv == 'ALL':
+        pre_cal = data.get('calendar_forecast_agg')
+    else:
+        pre_cal = None
     fig_next7 = chart_next_week(data.get('raw_slice'), pv, pre_cal)
     tbl = reorder_table_html(df)
     if cal_tbl is not None and not cal_tbl.empty:
@@ -953,9 +1010,6 @@ def on_product_view(product_value, data):
 
     return (kpi, fig_sales, fig_inv, fig_perf, fig_next7, tbl, cal_div)
 
-
-# Expose the Flask server for gunicorn
-server = app.server
 
 if __name__ == '__main__':
     app.run(debug=True)
