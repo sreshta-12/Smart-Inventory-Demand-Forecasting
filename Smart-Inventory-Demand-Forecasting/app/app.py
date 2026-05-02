@@ -38,10 +38,25 @@ from src.reorder import DEFAULT_LEAD_TIME_DAYS
 model, scaler, feature_cols, scaled_columns = load_artifacts()
 
 FORECAST_TAIL_PER_SERIES = 200
-FORECAST_MAX_GROUPS = 100
+FORECAST_MAX_GROUPS = 20   # 20 groups is enough for aggregated 7-day forecast; 100 groups × 7 steps was the main bottleneck
+
+# ── Module-level payload cache ────────────────────────────────────────────────
+# Avoids re-running the heavy ML pipeline when the data hasn't changed.
+_payload_cache: dict | None = None
+_payload_cache_hash: str | None = None
+
+
+def _df_hash(df) -> str:
+    """Cheap hash to detect whether the DataFrame has changed."""
+    import hashlib
+    key = f'{len(df)}:{list(df.columns)}:{df.iloc[0].tolist() if len(df) else []}:{df.iloc[-1].tolist() if len(df) else []}'
+    return hashlib.md5(key.encode()).hexdigest()
+
+
 HISTORY_DAYS_ON_FORECAST_CHART = 120
 DASHBOARD_RECORDS_HISTORY_DAYS = 200
 RAW_SLICE_COLUMNS = [DATE, STORE_ID, PRODUCT_ID, UNITS_SOLD, INVENTORY_LEVEL, PRODUCT_NAME, PRICE, SEASONALITY]
+
 
 app = dash.Dash(__name__)
 app.title = 'Inventory Demand Forecasting'
@@ -100,7 +115,14 @@ def nums_as_plain_list(series):
     return plain
 
 
-def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
+def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool = False):
+    global _payload_cache, _payload_cache_hash
+
+    # Return cached result immediately if data hasn't changed
+    current_hash = _df_hash(df)
+    if not persist_forecasts and _payload_cache is not None and _payload_cache_hash == current_hash:
+        return (_payload_cache, None)
+
     df_in = ensure_training_columns(df.copy())
     slice_scored, full_timeline = run_batch_predict(
         df_in, model, scaler, feature_cols, scaled_columns,
@@ -200,6 +222,9 @@ def build_payload_from_df(df: pd.DataFrame, persist_forecasts: bool=False):
         'calendar_forecast_agg': calendar_forecast_agg,
         'meta': meta,
     }
+    # Store in module cache
+    _payload_cache = payload
+    _payload_cache_hash = current_hash
     return (payload, None)
 
 
@@ -644,7 +669,7 @@ def make_layout():
     )
     btn_row = html.Div([load_btn, reload_btn], style={'textAlign': 'center', 'marginBottom': '12px'})
     startup_timer = dcc.Interval(id='startup-load', interval=1, n_intervals=0, max_intervals=1)
-    poll_timer = dcc.Interval(id='live-poll', interval=20000, n_intervals=0)
+    poll_timer = dcc.Interval(id='live-poll', interval=120000, n_intervals=0)  # 2-min poll; was 20s
     product_dd = dcc.Dropdown(
         id='product-filter',
         options=[{'label': 'All Products', 'value': 'ALL'}],
